@@ -97,4 +97,4 @@ streamlit
 --- 
 
 ## Access Dashboard: 
-http://18.219.130.50:8501
+http://3.19.32.216:8502/
