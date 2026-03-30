@@ -3,6 +3,7 @@ import boto3
 import pandas as pd
 import numpy as np
 import time
+import gc  # garbage collector
 from datetime import datetime, timedelta, timezone
 from scipy import stats
 from sklearn.model_selection import train_test_split
@@ -10,7 +11,10 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics import accuracy_score, confusion_matrix
 from sklearn.preprocessing import StandardScaler
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend = less memory
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 # ─────────────────────────────────────────
 # PAGE CONFIG
@@ -39,8 +43,6 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; background-colo
 .metric-card.purple::before  { background: linear-gradient(90deg, #7c3aed, #a855f7); }
 .metric-card.violet::before  { background: linear-gradient(90deg, #a855f7, #ec4899); }
 .metric-card.cyan::before    { background: linear-gradient(90deg, #06b6d4, #0ea5e9); }
-.metric-card.teal::before    { background: linear-gradient(90deg, #14b8a6, #06b6d4); }
-.metric-card.rose::before    { background: linear-gradient(90deg, #f43f5e, #e11d48); }
 .metric-card.amber::before   { background: linear-gradient(90deg, #f59e0b, #f97316); }
 .metric-label { font-size: 0.72rem; color: #475569; text-transform: uppercase; letter-spacing: 1.5px; font-weight: 600; margin-bottom: 0.5rem; font-family: 'Space Mono', monospace; }
 .metric-value { font-family: 'Space Mono', monospace; font-size: 2rem; font-weight: 700; color: #f1f5f9; line-height: 1; }
@@ -57,7 +59,6 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; background-colo
 .remediation-medium { background: #1a140a; border-left: 3px solid #f59e0b; padding: 10px 14px; margin: 5px 0; border-radius: 0 6px 6px 0; font-size: 0.82rem; color: #fcd34d; }
 .remediation-high   { background: #1a0a0a; border-left: 3px solid #ef4444; padding: 10px 14px; margin: 5px 0; border-radius: 0 6px 6px 0; font-size: 0.82rem; color: #fca5a5; }
 .info-box    { background: #0d1117; border: 1px solid #1e293b; border-radius: 10px; padding: 1.2rem 1.4rem; font-size: 0.85rem; color: #94a3b8; line-height: 1.7; }
-.info-box-if { background: #0d0d17; border: 1px solid #2d1f3d; border-radius: 10px; padding: 1.2rem 1.4rem; font-size: 0.85rem; color: #c4b5fd; line-height: 1.7; }
 .model-chip-lr { display: inline-block; background: #0f1a2e; border: 1px solid #3b82f6; color: #93c5fd; font-family: 'Space Mono', monospace; font-size: 0.7rem; padding: 4px 12px; border-radius: 20px; margin-right: 8px; }
 .model-chip-if { display: inline-block; background: #1a0f2e; border: 1px solid #7c3aed; color: #c4b5fd; font-family: 'Space Mono', monospace; font-size: 0.7rem; padding: 4px 12px; border-radius: 20px; margin-right: 8px; }
 .divider       { border: none; border-top: 1px solid #1e293b; margin: 2rem 0; }
@@ -74,6 +75,9 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; background-colo
 .timing-fast   { color:#4ade80; font-family:'Space Mono',monospace; font-weight:700; font-size:1.6rem; }
 .timing-medium { color:#fcd34d; font-family:'Space Mono',monospace; font-weight:700; font-size:1.6rem; }
 .timing-slow   { color:#f87171; font-family:'Space Mono',monospace; font-weight:700; font-size:1.6rem; }
+/* Streamlit expander override for dark theme */
+details { background: #0d1117 !important; border: 1px solid #1e293b !important; border-radius: 10px !important; }
+summary { color: #94a3b8 !important; font-family: 'Space Mono', monospace !important; font-size: 0.8rem !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -82,7 +86,7 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; background-colo
 # ─────────────────────────────────────────
 REGION      = "us-east-2"
 INSTANCE_ID = "i-0372640781068e64b"
-ENABLE_STOP = False  # set True only for live demo
+ENABLE_STOP = False
 
 ec2_client        = boto3.client("ec2",        region_name=REGION)
 cloudwatch_client = boto3.client("cloudwatch", region_name=REGION)
@@ -113,7 +117,7 @@ CAT_META = {
     CAT_CPU_SPIKE : {"cls": "cat-cpu",      "icon": "🔴", "desc": "Sudden CPU surge above 2.5σ from baseline"},
     CAT_NET_SPIKE : {"cls": "cat-network",  "icon": "🔵", "desc": "Sudden surge in NetworkIn or NetworkOut"},
     CAT_COMBINED  : {"cls": "cat-combined", "icon": "🟠", "desc": "CPU and Network both elevated — possible crypto-mining or exfiltration"},
-    CAT_IDLE_WASTE: {"cls": "cat-idle",     "icon": "🟢", "desc": "CPU near 0% for sustained periods — instance idle, cost wasted"},
+    CAT_IDLE_WASTE: {"cls": "cat-idle",     "icon": "🟢", "desc": "Workload terminated unexpectedly — CPU dropped sharply from active to near-zero"},
     CAT_NET_ASYM  : {"cls": "cat-asym",     "icon": "🟣", "desc": "High NetworkOut vs low NetworkIn — potential data leak pattern"},
 }
 
@@ -121,17 +125,19 @@ def categorise_anomalies(df):
     df["net_in_z"]  = np.abs(stats.zscore(df["network_in_mb"].fillna(0)  + 1e-9))
     df["net_out_z"] = np.abs(stats.zscore(df["network_out_mb"].fillna(0) + 1e-9))
 
-    df["is_idle_point"] = df["cpu_usage_pct"] < 2.0
-    df["idle_streak"]   = (
-        df["is_idle_point"]
-          .groupby((df["is_idle_point"] != df["is_idle_point"].shift()).cumsum())
-          .transform("cumsum")
-    )
-    df["idle_anomaly"] = (df["idle_streak"] >= 3) & df["is_idle_point"]
+    # ── Flipped Idle Waste logic ──
+    # Detect sudden DROP from activity to near-zero rather than sustained low CPU
+    # "Active" = CPU above 5%, "Idle" = CPU below 1%
+    # Flag when CPU was active in the previous window and drops sharply to idle
+    cpu         = df["cpu_usage_pct"]
+    was_active  = cpu.shift(1) > 5.0    # previous datapoint was active
+    now_idle    = cpu < 1.0             # current datapoint is near-zero
+    drop_amount = cpu.shift(1) - cpu    # how much it dropped
+    df["idle_anomaly"] = was_active & now_idle & (drop_amount > 4.0)
 
     cats = []
-    for _, row in df.iterrows():
-        row_cats = []
+    for idx, row in df.iterrows():
+        row_cats    = []
         cpu_z       = row["z_score"]
         net_in_z    = row["net_in_z"]
         net_out_z   = row["net_out_z"]
@@ -156,8 +162,34 @@ def categorise_anomalies(df):
     return df
 
 # ─────────────────────────────────────────
-# REMEDIATION ENGINE
+# REMEDIATION ENGINE WITH COOLDOWN
 # ─────────────────────────────────────────
+
+import os
+import subprocess
+
+COOLDOWN_FILE = "/home/ec2-user/cloudsentinel_cooldown.txt"  # Permanent location
+COOLDOWN_MINUTES = 15
+
+def is_in_cooldown():
+    """Check if we're still in cooldown period"""
+    if not os.path.exists(COOLDOWN_FILE):
+        return False
+    
+    try:
+        with open(COOLDOWN_FILE, 'r') as f:
+            last_remediation = float(f.read().strip())
+        
+        elapsed = time.time() - last_remediation
+        return elapsed < (COOLDOWN_MINUTES * 60)
+    except:
+        return False
+
+def set_cooldown():
+    """Record that we just remediated"""
+    with open(COOLDOWN_FILE, 'w') as f:
+        f.write(str(time.time()))
+
 def classify_severity(z):
     if z >= 6.0:   return "HIGH"
     elif z >= 4.0: return "MEDIUM"
@@ -195,26 +227,50 @@ def create_alarm(z):
 def stop_instance():
     if not ENABLE_STOP:
         return False, "Stop skipped (safe mode)"
+    
+    if is_in_cooldown():
+        try:
+            minutes_left = COOLDOWN_MINUTES - ((time.time() - float(open(COOLDOWN_FILE).read())) / 60)
+        except:
+            minutes_left = COOLDOWN_MINUTES
+        return False, f"In cooldown ({minutes_left:.1f}min remaining)"
+    
     try:
+        # Step 1: Stop the monitored instance via boto3 (NOT CloudSentinel itself)
         ec2_client.stop_instances(InstanceIds=[INSTANCE_ID])
-        return True, "Stop command issued"
+        set_cooldown()
+        
+        # Step 2: Schedule a restart of the instance after cooldown
+        # Uses a detached background process — CloudSentinel itself stays alive
+        subprocess.Popen(
+            ["bash", "-c", f"sleep {COOLDOWN_MINUTES * 60} && aws ec2 start-instances --instance-ids {INSTANCE_ID} --region {REGION}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        
+        return True, f"EC2 instance stopped · Auto-restart in {COOLDOWN_MINUTES}min"
+    
     except Exception as e:
         return False, str(e)
 
 def remediate(z, cpu, ts):
     severity = classify_severity(z)
     actions  = []
+    
     if severity in ["LOW", "MEDIUM", "HIGH"]:
         ok, msg = tag_instance(z, severity, ts)
         actions.append({"action": "Tag Instance",    "ok": ok, "msg": msg})
+    
     if severity in ["MEDIUM", "HIGH"]:
         ok, msg = create_alarm(z)
         actions.append({"action": "Create CW Alarm", "ok": ok, "msg": msg})
+    
     if severity == "HIGH":
         ok, msg = stop_instance()
-        actions.append({"action": "Stop Instance",   "ok": ok, "msg": msg})
+        actions.append({"action": "Restart Service",   "ok": ok, "msg": msg})
+    
     return severity, actions
-
 # ─────────────────────────────────────────
 # INSTANCE STATUS
 # ─────────────────────────────────────────
@@ -245,7 +301,7 @@ def run_pipeline():
         r = cloudwatch_client.get_metric_statistics(
             Namespace="AWS/EC2", MetricName=name,
             Dimensions=[{"Name": "InstanceId", "Value": INSTANCE_ID}],
-            StartTime=datetime.now(timezone.utc) - timedelta(hours=24),
+            StartTime=datetime.now(timezone.utc) - timedelta(hours=15),  # Reduced from 24h
             EndTime=datetime.now(timezone.utc),
             Period=300, Statistics=["Average"]
         )
@@ -267,7 +323,7 @@ def run_pipeline():
             df[col] /= (1024 * 1024)
 
     if len(df) < 10:
-        return (None,) * 13
+        return (None,) * 12
 
     df["z_score"]    = np.abs(stats.zscore(df["cpu_usage_pct"]))
     df["is_anomaly"] = (df["z_score"] > 2.5).astype(int)
@@ -279,23 +335,29 @@ def run_pipeline():
     df = categorise_anomalies(df)
 
     # ── Logistic Regression (optimised) ──
+    stratify_param = y if (len(np.unique(y)) > 1 and np.min(np.bincount(y)) >= 2) else None
+
     X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.5, random_state=42, stratify=y
+        X, y, test_size=0.5, random_state=42, stratify=stratify_param
     )
     sc     = StandardScaler()
     X_tr_s = sc.fit_transform(X_tr)
     X_te_s = sc.transform(X_te)
 
+    # Limit training data to prevent memory spike
+    MAX_TRAIN_SAMPLES = 200
+    if len(X_tr) > MAX_TRAIN_SAMPLES:
+        sample_idx = np.random.choice(len(X_tr), MAX_TRAIN_SAMPLES, replace=False)
+        X_tr_s = X_tr_s[sample_idx]
+        y_tr = y_tr[sample_idx]
+
     t0_lr = time.perf_counter()
     lr_model = LogisticRegression(
-        max_iter=300,
-        class_weight="balanced",
-        solver="lbfgs",
-        tol=1e-3,
+        max_iter=300, class_weight="balanced", solver="lbfgs", tol=1e-3,
     )
     lr_model.fit(X_tr_s, y_tr)
     y_pred_lr = lr_model.predict(X_te_s)
-    lr_time   = (time.perf_counter() - t0_lr) * 1000
+    lr_time   = (time.perf_counter() - t0_lr) * 1000 
 
     lr_acc   = accuracy_score(y_te, y_pred_lr)
     lr_cm    = confusion_matrix(y_te, y_pred_lr, labels=[0, 1])
@@ -312,12 +374,8 @@ def run_pipeline():
 
     t0_if = time.perf_counter()
     if_model = IsolationForest(
-        n_estimators=50,
-        contamination=contamination,
-        max_samples="auto",
-        bootstrap=False,
-        n_jobs=-1,
-        random_state=42,
+        n_estimators=50, contamination=contamination,
+        max_samples="auto", bootstrap=False, n_jobs=1, random_state=42,
     )
     if_model.fit(X_scaled)
     if_preds  = if_model.predict(X_scaled)
@@ -342,9 +400,14 @@ def run_pipeline():
 # ─────────────────────────────────────────
 # REFRESH
 # ─────────────────────────────────────────
-if st.button("🔄 Refresh Data"):
-    st.cache_data.clear()
-    st.rerun()
+col_refresh, col_caption = st.columns([1, 4])
+with col_refresh:
+    if st.button("🔄 Refresh Data"):
+        st.cache_data.clear()
+        gc.collect()  # Clean memory before refresh
+        st.rerun()
+with col_caption:
+    st.caption("⚠️ Refresh triggers full pipeline re-run · Use sparingly")
 
 with st.spinner("Fetching live AWS telemetry..."):
     result = run_pipeline()
@@ -376,8 +439,8 @@ for cats in df["anomaly_categories"]:
             cat_counts[c] += 1
 
 c1, c2, c3, c4, c5 = st.columns(5)
-cards = [
-    (c1, "",        "Total Datapoints", str(total),             "Last 24h · 5min intervals"),
+for col, cls, label, val, sub in [
+    (c1, "",        "Total Datapoints", str(total),             "Last 6h · 5min intervals"),
     (c2, "warning", "Peak Z-Score",     f"{max_z:.2f}σ",        "Threshold 2.5σ"),
     (c3, "danger" if latest_cpu > 20 else "success", "Current CPU", f"{latest_cpu:.2f}%",
          df["Timestamp"].max().strftime("%H:%M UTC")),
@@ -385,8 +448,7 @@ cards = [
          f"Accuracy {lr_acc*100:.1f}%"),
     (c5, "purple" if n_anom_if > 0 else "success",  "IF Anomalies", str(n_anom_if),
          f"Accuracy {if_acc*100:.1f}%"),
-]
-for col, cls, label, val, sub in cards:
+]:
     with col:
         st.markdown(f"""<div class="metric-card {cls}">
             <div class="metric-label">{label}</div>
@@ -397,7 +459,7 @@ for col, cls, label, val, sub in cards:
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────
-# MODEL EXECUTION TIMING
+# EXECUTION TIMING
 # ─────────────────────────────────────────
 st.markdown('<div class="section-header-perf">Model Execution Performance · Per Batch (300s interval)</div>', unsafe_allow_html=True)
 
@@ -407,8 +469,8 @@ def timing_cls(ms):
 def timing_label(ms):
     return "FAST" if ms < 50 else ("MODERATE" if ms < 200 else "SLOW")
 
-total_time  = lr_time + if_time
-budget_pct  = (total_time / (300 * 1000)) * 100
+total_time = lr_time + if_time
+budget_pct = (total_time / (300 * 1000)) * 100
 
 t1, t2, t3, t4 = st.columns(4)
 with t1:
@@ -444,13 +506,16 @@ fig.patch.set_facecolor("#0a1a17"); ax.set_facecolor("#0a1a17")
 bars = ax.barh(["Isolation Forest", "Logistic Regression"], [if_time, lr_time],
                color=["#a855f7", "#3b82f6"], alpha=0.85, height=0.4)
 for bar, val in zip(bars, [if_time, lr_time]):
-    ax.text(val + 0.3, bar.get_y() + bar.get_height() / 2,
+    ax.text(val + 0.1, bar.get_y() + bar.get_height() / 2,
             f"{val:.2f} ms", va="center", color="#94a3b8", fontsize=9)
 ax.set_xlabel("Execution Time (ms)", color="#14b8a6", fontsize=8)
 ax.set_title("Model Execution Time Comparison", color="#14b8a6", fontsize=10, loc="left", pad=8)
 ax.tick_params(colors="#475569", labelsize=9); ax.spines[:].set_color("#0a2a27")
 ax.grid(color="#0a2a27", linewidth=0.5, alpha=0.5, axis="x")
-fig.tight_layout(); st.pyplot(fig); plt.close()
+fig.tight_layout()
+st.pyplot(fig)
+plt.close(fig)
+gc.collect()
 
 st.markdown("<br>", unsafe_allow_html=True)
 
@@ -518,7 +583,6 @@ st.markdown("<br>", unsafe_allow_html=True)
 # Multi-metric timeline
 fig, axes = plt.subplots(3, 1, figsize=(12, 6), sharex=True)
 fig.patch.set_facecolor("#0d1117")
-
 for ax, col, color, title, cat1, cat2 in [
     (axes[0], "cpu_usage_pct",  "#ef4444", "CPU Utilization (%)", CAT_CPU_SPIKE,  CAT_COMBINED),
     (axes[1], "network_in_mb",  "#3b82f6", "Network In (MB)",     CAT_NET_SPIKE,  CAT_NET_ASYM),
@@ -527,7 +591,6 @@ for ax, col, color, title, cat1, cat2 in [
     ax.set_facecolor("#0d1117")
     ax.plot(df.index, df[col], color=color, linewidth=1.1, alpha=0.7)
     ax.fill_between(df.index, df[col], alpha=0.08, color=color)
-
     mask1 = df["anomaly_categories"].apply(lambda x: cat1 in x)
     if mask1.any():
         ax.scatter(df.index[mask1], df[col][mask1],
@@ -536,15 +599,16 @@ for ax, col, color, title, cat1, cat2 in [
     if mask2.any():
         ax.scatter(df.index[mask2], df[col][mask2],
                    color="#a855f7", s=50, zorder=5, marker="D", label=cat2, alpha=0.9)
-
     ax.set_title(title, color="#94a3b8", fontsize=9, loc="left", pad=4)
     ax.tick_params(colors="#475569", labelsize=7)
     ax.spines[:].set_color("#2a1f0a")
     ax.grid(color="#2a1f0a", linewidth=0.4, alpha=0.5)
     ax.legend(facecolor="#0d1117", edgecolor="#2a1f0a", labelcolor="#94a3b8", fontsize=7, loc="upper right")
-
 fig.suptitle("Multi-Metric Anomaly Category Timeline", color="#f59e0b", fontsize=11, y=1.01)
-fig.tight_layout(); st.pyplot(fig); plt.close()
+fig.tight_layout()
+st.pyplot(fig)
+plt.close(fig)
+gc.collect()
 
 st.markdown("<br>", unsafe_allow_html=True)
 
@@ -556,26 +620,28 @@ legend_html += "</div>"
 st.markdown(legend_html, unsafe_allow_html=True)
 st.markdown("<br>", unsafe_allow_html=True)
 
-# Per-row breakdown
+# ── Dropdown for per-datapoint breakdown ──
 flagged_rows = df[df["anomaly_categories"].apply(lambda x: len(x) > 0)].copy()
-if len(flagged_rows) > 0:
-    st.markdown(f"**{len(flagged_rows)} datapoints carry at least one anomaly category:**")
-    for _, row in flagged_rows.iterrows():
-        ts = row["Timestamp"].strftime("%Y-%m-%d %H:%M UTC") \
-             if hasattr(row["Timestamp"], "strftime") else str(row["Timestamp"])
-        chips = " ".join([
-            f'<span class="{CAT_META[c]["cls"]}">{CAT_META[c]["icon"]} {c}</span>'
-            for c in row["anomaly_categories"]
-        ])
-        st.markdown(f"""<div class="cat-row">
-            <b style="color:#e2e8f0">{ts}</b> &nbsp;|&nbsp;
-            CPU: <b>{row['cpu_usage_pct']:.2f}%</b> &nbsp;|&nbsp;
-            Net↓ <b>{row['network_in_mb']:.4f} MB</b> &nbsp;|&nbsp;
-            Net↑ <b>{row['network_out_mb']:.4f} MB</b><br>{chips}
-        </div>""", unsafe_allow_html=True)
-else:
-    st.markdown('<div class="info-box">✅ No multi-metric anomaly categories detected in current window.</div>',
-                unsafe_allow_html=True)
+n_flagged    = len(flagged_rows)
+
+with st.expander(f"🔍 View Flagged Datapoints ({n_flagged} events detected) — click to expand", expanded=False):
+    if n_flagged > 0:
+        for _, row in flagged_rows.iterrows():
+            ts = row["Timestamp"].strftime("%Y-%m-%d %H:%M UTC") \
+                 if hasattr(row["Timestamp"], "strftime") else str(row["Timestamp"])
+            chips = " ".join([
+                f'<span class="{CAT_META[c]["cls"]}">{CAT_META[c]["icon"]} {c}</span>'
+                for c in row["anomaly_categories"]
+            ])
+            st.markdown(f"""<div class="cat-row">
+                <b style="color:#e2e8f0">{ts}</b> &nbsp;|&nbsp;
+                CPU: <b>{row['cpu_usage_pct']:.2f}%</b> &nbsp;|&nbsp;
+                Net↓ <b>{row['network_in_mb']:.4f} MB</b> &nbsp;|&nbsp;
+                Net↑ <b>{row['network_out_mb']:.4f} MB</b><br>{chips}
+            </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="info-box">✅ No anomaly categories detected in current window.</div>',
+                    unsafe_allow_html=True)
 
 # ─────────────────────────────────────────
 # LR TELEMETRY
@@ -601,9 +667,11 @@ for col, y_data, title, color, show_thresh in [
         ax.tick_params(colors="#475569", labelsize=8); ax.spines[:].set_color("#1e293b")
         ax.legend(facecolor="#0d1117", edgecolor="#1e293b", labelcolor="#94a3b8", fontsize=8)
         ax.grid(color="#1e293b", linewidth=0.5, alpha=0.5)
-        fig.tight_layout(); st.pyplot(fig); plt.close()
+        fig.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+        gc.collect()
 
-# LR Performance
 st.markdown('<div class="section-header">Model Performance <span class="badge-lr">Logistic Regression</span></div>', unsafe_allow_html=True)
 ch3, ch4 = st.columns(2)
 with ch3:
@@ -620,7 +688,10 @@ with ch3:
     for i in range(2):
         for j in range(2):
             ax.text(j, i, str(lr_cm[i,j]), ha="center", va="center", color="white", fontsize=14, fontweight="bold")
-    fig.tight_layout(); st.pyplot(fig); plt.close()
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+    gc.collect()
 with ch4:
     fig, ax = plt.subplots(figsize=(5, 3))
     fig.patch.set_facecolor("#0d1117"); ax.set_facecolor("#0d1117")
@@ -634,7 +705,10 @@ with ch4:
     for bar, val in zip(bars, lr_coefs):
         ax.text(val+(0.01 if val>=0 else -0.01), bar.get_y()+bar.get_height()/2,
                 f"{val:.4f}", va="center", ha="left" if val>=0 else "right", color="#94a3b8", fontsize=8)
-    fig.tight_layout(); st.pyplot(fig); plt.close()
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+    gc.collect()
 
 # ═══════════════════════════════════════════
 # ISOLATION FOREST
@@ -687,7 +761,10 @@ with ich1:
     ax.tick_params(colors="#475569", labelsize=8); ax.spines[:].set_color("#2d1f3d")
     ax.legend(facecolor="#0d1117", edgecolor="#2d1f3d", labelcolor="#94a3b8", fontsize=8)
     ax.grid(color="#2d1f3d", linewidth=0.5, alpha=0.5)
-    fig.tight_layout(); st.pyplot(fig); plt.close()
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+    gc.collect()
 with ich2:
     fig, ax = plt.subplots(figsize=(7, 3))
     fig.patch.set_facecolor("#0d1117"); ax.set_facecolor("#0d1117")
@@ -699,14 +776,17 @@ with ich2:
     ax.tick_params(colors="#475569", labelsize=8); ax.spines[:].set_color("#2d1f3d")
     ax.legend(facecolor="#0d1117", edgecolor="#2d1f3d", labelcolor="#94a3b8", fontsize=8)
     ax.grid(color="#2d1f3d", linewidth=0.5, alpha=0.5)
-    fig.tight_layout(); st.pyplot(fig); plt.close()
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+    gc.collect()
 
 st.markdown('<div class="section-header-if">IF Model Performance</div>', unsafe_allow_html=True)
 ich3, ich4 = st.columns(2)
 with ich3:
     fig, ax = plt.subplots(figsize=(4, 3))
     fig.patch.set_facecolor("#0d1117"); ax.set_facecolor("#0d1117")
-    ax.imshow(if_cm, interpolation="nearest", cmap=plt.cm.get_cmap("Purples"))
+    ax.imshow(if_cm, interpolation="nearest", cmap="Purples")  # Fixed deprecation
     ax.set_xticks([0,1]); ax.set_yticks([0,1])
     ax.set_xticklabels(["Normal","Anomaly"], color="#c4b5fd", fontsize=9)
     ax.set_yticklabels(["Normal","Anomaly"], color="#c4b5fd", fontsize=9)
@@ -717,7 +797,10 @@ with ich3:
     for i in range(2):
         for j in range(2):
             ax.text(j, i, str(if_cm[i,j]), ha="center", va="center", color="white", fontsize=14, fontweight="bold")
-    fig.tight_layout(); st.pyplot(fig); plt.close()
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+    gc.collect()
 with ich4:
     fig, ax = plt.subplots(figsize=(5, 3))
     fig.patch.set_facecolor("#0d1117"); ax.set_facecolor("#0d1117")
@@ -732,13 +815,24 @@ with ich4:
     ax.tick_params(colors="#475569", labelsize=8); ax.spines[:].set_color("#2d1f3d")
     ax.legend(facecolor="#0d1117", edgecolor="#2d1f3d", labelcolor="#c4b5fd", fontsize=8)
     ax.grid(color="#2d1f3d", linewidth=0.5, alpha=0.5)
-    fig.tight_layout(); st.pyplot(fig); plt.close()
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+    gc.collect()
 
 # ─────────────────────────────────────────
 # MODEL COMPARISON
 # ─────────────────────────────────────────
 st.markdown("<hr class='divider'>", unsafe_allow_html=True)
 st.markdown('<div class="section-header-compare">Model Comparison · LR vs Isolation Forest</div>', unsafe_allow_html=True)
+
+agree_mask   = (df["lr_anomaly"] == 1) & (df["if_anomaly"] == 1)
+lr_only_mask = (df["lr_anomaly"] == 1) & (df["if_anomaly"] == 0)
+if_only_mask = (df["lr_anomaly"] == 0) & (df["if_anomaly"] == 1)
+n_both    = int(agree_mask.sum())
+n_lr_only = int(lr_only_mask.sum())
+n_if_only = int(if_only_mask.sum())
+n_neither = total - n_both - n_lr_only - n_if_only
 
 comp1, comp2 = st.columns(2)
 with comp1:
@@ -756,38 +850,42 @@ with comp1:
         ax.spines[:].set_color("#1e293b")
         ax.grid(color="#1e293b", linewidth=0.4, alpha=0.4)
     fig.suptitle("Anomaly Detections: CPU Over Time", color="#94a3b8", fontsize=10, y=1.01)
-    fig.tight_layout(); st.pyplot(fig); plt.close()
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+    gc.collect()
 
 with comp2:
-    agree_mask   = (df["lr_anomaly"] == 1) & (df["if_anomaly"] == 1)
-    lr_only_mask = (df["lr_anomaly"] == 1) & (df["if_anomaly"] == 0)
-    if_only_mask = (df["lr_anomaly"] == 0) & (df["if_anomaly"] == 1)
-    n_both    = int(agree_mask.sum())
-    n_lr_only = int(lr_only_mask.sum())
-    n_if_only = int(if_only_mask.sum())
-    n_neither = total - n_both - n_lr_only - n_if_only
+    pie_data   = [(n_both, "#22c55e", "Both Agree"),
+                  (n_lr_only, "#3b82f6", "LR Only"),
+                  (n_if_only, "#a855f7", "IF Only"),
+                  (n_neither, "#334155", "Neither")]
+    pie_data   = [(v, c, l) for v, c, l in pie_data if v > 0]
+    sizes      = [v for v, _, _ in pie_data]
+    colors_pie = [c for _, c, _ in pie_data]
 
-    labels_pie, sizes_pie, colors_pie = [], [], []
-    for lbl, sz, clr in [
-        ("Both Agree", n_both, "#22c55e"), ("LR Only", n_lr_only, "#3b82f6"),
-        ("IF Only", n_if_only, "#a855f7"), ("Neither", n_neither, "#1e293b"),
-    ]:
-        if sz > 0:
-            labels_pie.append(f"{lbl}\n({sz})")
-            sizes_pie.append(sz)
-            colors_pie.append(clr)
-
-    fig, ax = plt.subplots(figsize=(5, 3))
+    fig, ax = plt.subplots(figsize=(5, 4))
     fig.patch.set_facecolor("#0d1117"); ax.set_facecolor("#0d1117")
-    _, texts, autotexts = ax.pie(
-        sizes_pie, labels=labels_pie, colors=colors_pie,
-        autopct="%1.0f%%", startangle=90,
-        textprops={"color": "#94a3b8", "fontsize": 8},
-        wedgeprops={"edgecolor": "#0d1117", "linewidth": 2}
+    _, _, autotexts = ax.pie(
+        sizes, colors=colors_pie, autopct="%1.0f%%", startangle=90,
+        pctdistance=0.75,
+        wedgeprops={"edgecolor": "#0d1117", "linewidth": 2},
+        textprops={"fontsize": 9}
     )
-    for at in autotexts: at.set_color("white"); at.set_fontsize(8)
+    for at in autotexts:
+        at.set_color("white"); at.set_fontweight("bold"); at.set_fontsize(9)
+    legend_patches = [
+        mpatches.Patch(color=c, label=f"{l}  ({v})")
+        for v, c, l in pie_data
+    ]
+    ax.legend(handles=legend_patches, loc="lower center",
+              bbox_to_anchor=(0.5, -0.18), ncol=2,
+              frameon=False, labelcolor="#94a3b8", fontsize=8)
     ax.set_title("Detection Agreement", color="#94a3b8", fontsize=10, pad=10, loc="left")
-    fig.tight_layout(); st.pyplot(fig); plt.close()
+    fig.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+    gc.collect()
 
 st.markdown("<br>", unsafe_allow_html=True)
 st.markdown(f"""<div class="info-box">
@@ -818,27 +916,29 @@ else:
     </div>""", unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
-    for _, row in anomalies.iterrows():
-        ts  = row["Timestamp"].strftime("%Y-%m-%d %H:%M UTC") \
-              if hasattr(row["Timestamp"], "strftime") else str(row["Timestamp"])
-        sev, actions = remediate(row["z_score"], row["cpu_usage_pct"], ts)
-        cls  = {"HIGH":"remediation-high","MEDIUM":"remediation-medium","LOW":"remediation-low"}.get(sev,"remediation-low")
-        icon = {"HIGH":"🔴","MEDIUM":"🟡","LOW":"🟢"}.get(sev,"⚪")
-        acts = " &nbsp;·&nbsp; ".join([f"{'✅' if a['ok'] else '⚠️'} {a['action']}: {a['msg']}" for a in actions])
-        if_agreed = row.get("if_anomaly", 0) == 1
-        if_badge  = '<span class="agree-badge">IF ✓</span>' if if_agreed else '<span class="disagree-badge">IF ✗</span>'
-        cat_chips = " ".join([
-            f'<span class="{CAT_META[c]["cls"]}">{CAT_META[c]["icon"]} {c}</span>'
-            for c in row.get("anomaly_categories", [])
-        ]) or '<span style="color:#475569;font-size:0.75rem;">no category</span>'
+    # ── Remediation events in a dropdown ──
+    with st.expander(f"⚙️ View Remediation Events ({len(anomalies)} triggered) — click to expand", expanded=True):
+        for _, row in anomalies.iterrows():
+            ts  = row["Timestamp"].strftime("%Y-%m-%d %H:%M UTC") \
+                  if hasattr(row["Timestamp"], "strftime") else str(row["Timestamp"])
+            sev, actions = remediate(row["z_score"], row["cpu_usage_pct"], ts)
+            cls  = {"HIGH":"remediation-high","MEDIUM":"remediation-medium","LOW":"remediation-low"}.get(sev,"remediation-low")
+            icon = {"HIGH":"🔴","MEDIUM":"🟡","LOW":"🟢"}.get(sev,"⚪")
+            acts = " &nbsp;·&nbsp; ".join([f"{'✅' if a['ok'] else '⚠️'} {a['action']}: {a['msg']}" for a in actions])
+            if_agreed = row.get("if_anomaly", 0) == 1
+            if_badge  = '<span class="agree-badge">IF ✓</span>' if if_agreed else '<span class="disagree-badge">IF ✗</span>'
+            cat_chips = " ".join([
+                f'<span class="{CAT_META[c]["cls"]}">{CAT_META[c]["icon"]} {c}</span>'
+                for c in row.get("anomaly_categories", [])
+            ]) or '<span style="color:#475569;font-size:0.75rem;">no category</span>'
 
-        st.markdown(f"""<div class="{cls}">
-            {icon} <b>{ts}</b> &nbsp;|&nbsp; Severity: <b>{sev}</b> &nbsp;|&nbsp;
-            CPU: <b>{row['cpu_usage_pct']:.2f}%</b> &nbsp;|&nbsp;
-            Z-Score: <b>{row['z_score']:.3f}σ</b> &nbsp;|&nbsp; {if_badge}<br>
-            <span style="font-size:0.75rem;">{cat_chips}</span><br>
-            <span style="opacity:0.8;font-size:0.75rem;">{acts}</span>
-        </div>""", unsafe_allow_html=True)
+            st.markdown(f"""<div class="{cls}">
+                {icon} <b>{ts}</b> &nbsp;|&nbsp; Severity: <b>{sev}</b> &nbsp;|&nbsp;
+                CPU: <b>{row['cpu_usage_pct']:.2f}%</b> &nbsp;|&nbsp;
+                Z-Score: <b>{row['z_score']:.3f}σ</b> &nbsp;|&nbsp; {if_badge}<br>
+                <span style="font-size:0.75rem;">{cat_chips}</span><br>
+                <span style="opacity:0.8;font-size:0.75rem;">{acts}</span>
+            </div>""", unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown("""<div class="info-box">
