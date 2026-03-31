@@ -115,7 +115,7 @@ Why'd we only place 13th? What did I do wrong that the others did right, even wi
 The answer to our loss lies in the final round's presentation. 
 I presented well, I'm sure of it, but I channelled all that speech skill in the wrong direction. I came across this revelation much later, after enduring the loss. 
 
-<strong>HACKATHONS</strong> don't give a damn about the technical complexity of your project, built a 100B parameter, multi-modal LLM from scratch but it can't save a company's money? <em>Disqualifed.</em> Built an isolation forest that can reduces costs from $x to $x-10000? You're on the pedestal, that's first place. 
+<strong>HACKATHONS</strong> don't give a damn about the technical complexity of your project, built a 100B parameter, multi-modal LLM from scratch but it can't save a company's money? <em>Disqualifed.</em> Built an isolation forest that can reduce costs from $x to $x-10000? You're on the pedestal, that's first place. 
 
 This is how it has always worked and it will continue to function this way forever. 
 How would your system, irrespective of its technical proficiency on paper, perform in real life when exposed to real data under unstable circumstances? And more importantly, does it add to the bills or does it save them a fortune? These are the only ways hackathons distinguish between what's good and what's best. 
