@@ -1,6 +1,13 @@
 #  Autonomous Cloud Cost Intelligence Platform
 
 > An autonomous system that monitors cloud infrastructure metrics, detects cost anomalies using machine learning, and lays the foundation for self-healing cloud environments without human intervention.
+> --- 
+
+## Access Dashboard: 
+http://3.19.32.216:8502/ 
+
+---
+
 
 --- 
  <h5> Before we proceed, please do read the final keynote at the end of this document. It's an invaluable doctrine I'd like to share. </h5>
